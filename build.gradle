@@ -1,0 +1,31 @@
+plugins {
+//	id 'org.springframework.boot' version '2.4.0-M2'
+//	id 'io.spring.dependency-management' version '1.0.10.RELEASE'
+	id 'java'
+}
+
+compileJava.options.encoding = 'UTF-8'
+
+tasks.withType(JavaCompile) {
+	options.encoding = 'UTF-8'
+}
+
+group = 'net.pucgenie'
+version = '0.0.1-SNAPSHOT'
+sourceCompatibility = '15'
+
+repositories {
+	mavenCentral()
+//	maven { url 'https://repo.spring.io/milestone' }
+	jcenter()
+}
+
+dependencies {
+//	implementation 'dnsjava:dnsjava:3.2.2'
+//	implementation 'org.springframework.boot:spring-boot-starter'
+//	testImplementation 'org.springframework.boot:spring-boot-starter-test'
+}
+
+test {
+	useJUnitPlatform()
+}
