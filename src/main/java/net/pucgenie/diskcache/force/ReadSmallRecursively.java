@@ -13,6 +13,8 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.Properties;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.ConsoleHandler;
 import java.util.logging.Handler;
 import java.util.logging.Level;
@@ -22,14 +24,31 @@ import java.util.regex.Pattern;
  *
  * @author pucgenie
  */
-public class ReadSmallRecursively {
+public class ReadSmallRecursively implements Runnable {
 
 	private static final java.util.ResourceBundle BUNDLE = java.util.ResourceBundle
-			.getBundle("net/pucgenie/diskcache/force/ReadSmallRecursively");
+			.getBundle(ReadSmallRecursively.class.getCanonicalName().replace('.', '/'));
 	private static final java.util.logging.Logger LOG = java.util.logging.Logger
 			.getLogger(ReadSmallRecursively.class.getName());
+	static {
+		if (LOG.getHandlers().length == 0) {
+			final Handler handler = new ConsoleHandler();// new StreamHandler(System.out, new SimpleFormatter());
+			handler.setLevel(Level.FINEST);
+			LOG.addHandler(handler);
+		}
+		if (LOG.getLevel() == null) {
+			LOG.setLevel(Level.FINEST);
+		}
+	}
 
-	private final ArrayList<File> smallFiles;
+	private final ArrayBlockingQueue<File> smallFiles = new ArrayBlockingQueue<>(0xFF);
+	private final ArrayList<File> dirsToScan = new ArrayList<>(0xFF);
+
+	private Thread cacheFiller = new Thread(null, this, "CacheFiller", 4);
+	{
+		cacheFiller.setDaemon(true);
+	}
+	private volatile boolean listingFinished = false;
 
 	/**
 	 * Wie viele Dateien sich (in etwa) in jedem bestimmten Verzeichnis befinden.
@@ -38,12 +57,14 @@ public class ReadSmallRecursively {
 
 	private int geladen;
 
-	private boolean kaputt = false;
+	/**
+	 * Anzahl von 4K-Blöcken, die "gelesen" werden sollen.
+	 */
+	private int limitRead = 0x1;
 
 	private Pattern filterIncl, filterExcl;
 
 	public ReadSmallRecursively(Optional<File> stF) {
-		int minKapazität = 0x1FFF;
 		stF.ifPresent(statsFile -> {
 			// mit der initial capacity so hoch wie der Anzahl der Dateien beim letzten
 			// Durchlauf initialisieren.
@@ -58,18 +79,42 @@ public class ReadSmallRecursively {
 			}
 			// eigentlicher Check wird in #link{#scan()} durchgeführt
 		});
-		smallFiles = new ArrayList<>(minKapazität);
 	}
 
-	static {
-		if (LOG.getHandlers().length == 0) {
-			final Handler handler = new ConsoleHandler();// new StreamHandler(System.out, new SimpleFormatter());
-			handler.setLevel(Level.FINEST);
-			LOG.addHandler(handler);
+	@Override
+	public void run() {
+		try {
+			dateiSchleife: while (!listingFinished || !smallFiles.isEmpty()) {
+				var aFile = smallFiles.poll(5, TimeUnit.SECONDS);
+				if (aFile == null) {
+					LOG.warning("Traverser is slow.");
+					continue;
+				}
+				if (aFile.canRead() == false) {
+					// wird momentan ignoriert. was bringt's...
+					continue dateiSchleife;
+				}
+				try (var ffif = new FileInputStream(aFile)) {
+					++geladen;
+					for (int nx = limitRead; nx > 0; --nx) {
+						// zum Ende eines 4K-Blobks springen und ein Byte lesen (und verwerfen)
+						ffif.skip(4095);
+						if (ffif.read() == -1) {
+							// nx = 0;
+							continue dateiSchleife;
+						}
+					}
+				} catch (FileNotFoundException ex) {
+					LOG.log(Level.SEVERE, "File vanished before being opened: {0}", aFile.getPath());
+				} catch (IOException ex) {
+					LOG.log(Level.SEVERE, "Couldn't read: {0}", aFile.getPath());
+				}
+			}
+		} catch (InterruptedException e) {
+			listingFinished = true;
+			LOG.log(Level.SEVERE, e, ()->"");
 		}
-		if (LOG.getLevel() == null) {
-			LOG.setLevel(Level.FINEST);
-		}
+		LOG.log(Level.FINEST, "CacheFiller finished.");
 	}
 
 	/**
@@ -93,107 +138,43 @@ public class ReadSmallRecursively {
 	 *
 	 * @param basisordner
 	 * @param rekursiv
+	 * @throws InterruptedException 
 	 */
-	public void scan(File basisordner, short rekursiv) {
-		String fstStr = stats != null ? stats.getProperty(basisordner.getAbsolutePath()) : null;
-		int oldSize = smallFiles.size();
-		if (fstStr != null && fstStr.isEmpty() == false) {
-			smallFiles.ensureCapacity(oldSize + Integer.parseInt(fstStr));
-		}
-		try {
-			for (var subFile : basisordner.list()) {
-				final var startTime = System.nanoTime();
-				if (filterIncl == null || filterIncl.matcher(subFile).matches()) {
-					if (filterExcl != null && filterExcl.matcher(subFile).matches()) {
-						measurement.add(System.nanoTime() - startTime);
-			continue;
-					}
-				} else {
+	public void scan(File basisordner, short rekursiv) throws InterruptedException {
+		for (var subFile : basisordner.list()) {
+			final var startTime = System.nanoTime();
+			if (filterIncl == null || filterIncl.matcher(subFile).matches()) {
+				if (filterExcl != null && filterExcl.matcher(subFile).matches()) {
 					measurement.add(System.nanoTime() - startTime);
-			continue;
+		continue;
 				}
+			} else {
 				measurement.add(System.nanoTime() - startTime);
+		continue;
+			}
+			measurement.add(System.nanoTime() - startTime);
 
-				final var sub = new File(basisordner, subFile);
-				if (sub.isDirectory() && rekursiv > 0) {
-					scan(sub, (short) (rekursiv - 1));
-					if (kaputt) {
-			return;
-					}
-				} else {
-					smallFiles.add(sub);
+			final var sub = new File(basisordner, subFile);
+			if (sub.isDirectory()) {
+				if (rekursiv > 0) {
+					dirsToScan.add(sub);
+				}
+			} else {
+				while (!smallFiles.offer(sub, 10, TimeUnit.SECONDS)) {
+					LOG.log(Level.WARNING, "Worker is slow, waiting...");
 				}
 			}
-		} catch (OutOfMemoryError oomERROR) {
-			oomERROR = null;
-			stats = null;
-			// GarbageCollector soll machen
-			kaputt = true;
-			smallFiles.clear();
-			// nochmal GC !
-			smallFiles.trimToSize();
-			// nochmal GC ...
-			return;
-		}
-		if (fstStr != null && oldSize != smallFiles.size()) {
-			assert smallFiles.size() > oldSize : "wtf?"; // NOI18N
-			stats.setProperty(basisordner.getAbsolutePath(), Integer.toString(smallFiles.size() - oldSize));
 		}
 	}
-
-	/**
-	 * Öffnet alle gescannten Dateien. Wenn deep false ist, liefert diese Methode
-	 * auf jeden Fall false.
-	 *
-	 * @param limitN
-	 * @param limitRead Anzahl von 4K-Blöcken, die "gelesen" werden sollen
-	 * @param deep      Durchsucht weitere Verzeichnisse, die beim Scannen zu tief
-	 *                  rekursiv waren.
-	 * @return deep && mehr Unterebenen gefunden.
-	 * @throws IOException
-	 */
-	public boolean load(int limitN, int limitRead, boolean deep) throws IOException {
-		var lastIdx = Math.min(smallFiles.size(), limitN);
-		LOG.log(Level.FINER, "lade {0}", lastIdx);
-		final var deeperList = new ArrayList<File>(10);
-		final var workList = smallFiles.subList(0, lastIdx);
-		final var liter = workList.listIterator(0);
-		dateiSchleife: while (liter.hasNext()) {
-			final File f = liter.next();
-			if (f.isDirectory()) {
-				deeperList.add(f);
-		continue;
-			}
-			if (f.canRead() == false) {
-				// wird momentan ignoriert. was bringt's...
-		continue;
-			}
-			try (FileInputStream ffif = new FileInputStream(f)) {
-				++geladen;
-				for (int nx = limitRead; nx > 0; --nx) {
-					// zum Ende eines 4K-Blobks springen und ein Byte lesen (und verwerfen)
-					ffif.skip(4095);
-					if (ffif.read() == -1) {
-						// nx = 0;
-						continue dateiSchleife;
-					}
-				}
-			} catch (FileNotFoundException ex) {
-				assert false : ex;
-			}
-		}
-		workList.clear();
-		if (deep) {
-			// nicht parallelisieren!
-			for (var f : deeperList) {
-				scan(f, (short) 0);
-			}
-		} else {
-			smallFiles.addAll(deeperList);
-		}
-		// deeper.clear();
-		// deeper = null;
-		return smallFiles.isEmpty() == false;
+	
+	public void scanLoop(File basedir, short recursions) throws InterruptedException {
+		dirsToScan.add(basedir);
+		do {
+			for (int i = dirsToScan.size(); i --> 0; )
+			scan(dirsToScan.remove(i), recursions);
+		} while (!dirsToScan.isEmpty() && recursions --> 0);
+		LOG.log(Level.FINEST, "Traverser finished.");
+		this.listingFinished = true;
 	}
 
 	/**
@@ -205,6 +186,7 @@ public class ReadSmallRecursively {
 		if (stats == null) {
 			throw new IllegalStateException(BUNDLE.getString("KEINE STATS GELADEN"));
 		}
+		LOG.log(Level.FINE, "Storing stats in {0}", stF.getAbsolutePath());
 		try (var stos = new FileOutputStream(stF)) {
 			stats.store(stos, BUNDLE.getString("GENERATED STATS"));
 		}
@@ -214,10 +196,9 @@ public class ReadSmallRecursively {
 		return stats != null;
 	}
 
-	
 	public void syncStats(File stF) throws UncheckedIOException {
 		if (!hasStats()) {
-	return;
+			return;
 		}
 		try {
 			saveStats(stF);
@@ -240,7 +221,7 @@ public class ReadSmallRecursively {
 	 * @param args the command line arguments
 	 * @throws java.io.IOException
 	 */
-	public static void main(String[] args) throws IOException {
+	public static void main(String[] args) throws IOException, InterruptedException {
 		if (args.length > 0) {
 			switch (args[0]) {
 			case "/?": // NOI18N
@@ -255,8 +236,10 @@ public class ReadSmallRecursively {
 			}
 		}
 
-		var basedir = Optional.ofNullable(System.getProperty("rsr.basedir")).map(basedirStr -> new File(basedirStr)).orElse(new File(".")); // NOI18N
-		var recursions = Optional.ofNullable(System.getProperty("rsr.recursions")).map(Short::parseShort).orElse((short) 4); // NOI18N
+		var basedir = Optional.ofNullable(System.getProperty("rsr.basedir")).map(basedirStr -> new File(basedirStr))
+				.orElse(new File(".")); // NOI18N
+		short recursions = Optional.ofNullable(System.getProperty("rsr.recursions")).map(Short::parseShort)
+				.orElse((short) 4); // NOI18N
 		var upwards = Optional.ofNullable(System.getProperty("rsr.upwards")).map(Byte::parseByte).orElse((byte) 0); // NOI18N
 
 		/**
@@ -269,7 +252,7 @@ public class ReadSmallRecursively {
 		 * library file data *.csb Dying Light big files *.rpack Dying Light big files
 		 */
 		var filterExclStr = System.getProperty("rsr.filterExclude",
-				"(_.*)|(.*\\.bak)|(.*\\.dll)|(.*\\.csb)|(.*\\.rpack)"); // NOI18N
+				"(_.*)|(.*\\.bak)|(.*\\.csb)|(.*\\.rpack)"); // NOI18N
 
 		int filterCaseFlag = filterCase.equals("ci") ? Pattern.CASE_INSENSITIVE : 0;
 
@@ -281,7 +264,8 @@ public class ReadSmallRecursively {
 		}
 		LOG.log(Level.FINE, "scanne {0}", basedir.getAbsolutePath());
 
-		final var statsFile = Optional.ofNullable(System.getProperty("rsr.stats")).map(statsFileStr -> new File(statsFileStr));
+		final var statsFile = Optional.ofNullable(System.getProperty("rsr.stats"))
+				.map(statsFileStr -> new File(statsFileStr));
 
 		final var rsr = new ReadSmallRecursively(statsFile);
 		filterInclProp.ifPresent(filterInclStr -> {
@@ -291,40 +275,28 @@ public class ReadSmallRecursively {
 		if (!filterExclStr.isEmpty()) {
 			rsr.filterExcl = Pattern.compile(filterExclStr, filterCaseFlag);
 		}
-		rsr.scan(basedir, recursions);
+		rsr.cacheFiller.start();
+		rsr.scanLoop(basedir, recursions);
+		rsr.cacheFiller.join(0);
+		assert rsr.smallFiles.isEmpty();
 
-		boolean logIt = Level.FINER.equals(LOG.getLevel());
-		String[] lmo = { "~", BUNDLE.getString("EINE EBENE MEHR WIRD GELADEN.")};
-		while (!rsr.kaputt && rsr.load(0x2FF, 0xF00, true)) {
-			if (logIt) {
-				lmo[0] = Integer.toString(rsr.geladen);
-				LOG.log(Level.FINER, "{0}\t{1}", lmo);
-			}
-		}
-		if (rsr.kaputt) {
-			LOG.log(Level.SEVERE,
-					"OutOfMemory Fehler - irgendwie überstanden, aber Einlesen war vermutlich unvollständig");
-		}
-		if (logIt) {
-			lmo[0] = Integer.toString(rsr.geladen);
-			lmo[1] = BUNDLE.getString("FERTIG.");
-			LOG.log(Level.FINE, "{0}\t{1}", lmo);
-		}
+		LOG.log(Level.FINE, "{0}\t{1}", new Object[] {Integer.toString(rsr.geladen), BUNDLE.getString("FERTIG."),});
 
 		{
 			final var measurement = rsr.measurement;
 			Collections.sort(measurement);
-			LOG.log(Level.FINEST, "Min filter time[ns]: {0}", measurement.get(0));
 			Number median = measurement.get(measurement.size() / 2);
 			if (measurement.size() % 2 == 0) {
 				median = (median.longValue() + measurement.get(measurement.size() / 2 + 1)) / 2.;
 			}
-			LOG.log(Level.FINEST, "{0}ns Median filter time, {1}ns max. filter time", new Object[] {median, measurement.get(measurement.size() - 1)});
 			long sum = 0;
 			for (long msw : measurement) {
 				sum += msw;
 			}
-			LOG.log(Level.FINEST, "{0}ms cumul. filter time", sum / 1_000_000.);
+			LOG.log(Level.FINE,
+					"{3}ms cumul. filter time, {2}ns min. filter time, {0}ns Median filter time, {1}ns max. filter time",
+					new Object[] { median, measurement.get(measurement.size() - 1), measurement.get(0),
+							sum / 1_000_000., });
 		}
 
 		statsFile.ifPresent(rsr::syncStats);
