@@ -97,7 +97,8 @@ public class ReadSmallRecursively implements Runnable {
 				try (var ffif = new FileInputStream(aFile)) {
 					++geladen;
 					for (int nx = limitRead; nx > 0; --nx) {
-						// zum Ende eines 4K-Blobks springen und ein Byte lesen (und verwerfen)
+						// zum Ende eines 4K-Blocks springen und ein Byte lesen (und verwerfen)
+						// if it skips zero bytes once, it doesn't really matter.
 						ffif.skip(4095);
 						if (ffif.read() == -1) {
 							// nx = 0;
@@ -112,7 +113,7 @@ public class ReadSmallRecursively implements Runnable {
 			}
 		} catch (InterruptedException e) {
 			listingFinished = true;
-			LOG.log(Level.SEVERE, e, ()->"");
+			LOG.log(Level.SEVERE, "", e);
 		}
 		LOG.log(Level.FINEST, "CacheFiller finished.");
 	}
