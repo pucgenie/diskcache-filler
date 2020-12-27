@@ -4,6 +4,8 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
@@ -58,9 +60,9 @@ public class ReadSmallRecursively implements Runnable {
 	private int geladen;
 
 	/**
-	 * Anzahl von 4K-Blöcken, die "gelesen" werden sollen.
+	 * Anzahl von 512B-Blöcken, die "gelesen" werden sollen.
 	 */
-	private int limitRead = 0x1;
+	private int limitRead = 0x4;
 
 	private Pattern filterIncl, filterExcl;
 
@@ -70,8 +72,7 @@ public class ReadSmallRecursively implements Runnable {
 			// Durchlauf initialisieren.
 			this.stats = new Properties();
 			if (statsFile.exists() && statsFile.canRead()) {
-				try (var fis = new FileInputStream(statsFile);
-						var sreader = new InputStreamReader(fis, StandardCharsets.UTF_8)) {
+				try (var fis = new FileReader(statsFile, StandardCharsets.UTF_8)) {
 					this.stats.load(fis);
 				} catch (IOException ex) {
 					LOG.log(Level.SEVERE, BUNDLE.getString("KONNTE STATS-DATEI NICHT LADEN."), ex);
@@ -97,9 +98,9 @@ public class ReadSmallRecursively implements Runnable {
 				try (var ffif = new FileInputStream(aFile)) {
 					++geladen;
 					for (int nx = limitRead; nx > 0; --nx) {
-						// zum Ende eines 4K-Blocks springen und ein Byte lesen (und verwerfen)
+						// zum Ende eines Blocks springen und ein Byte lesen (und verwerfen)
 						// if it skips zero bytes once, it doesn't really matter.
-						ffif.skip(4095);
+						ffif.skip(511);
 						if (ffif.read() == -1) {
 							// nx = 0;
 							continue dateiSchleife;
@@ -134,8 +135,8 @@ public class ReadSmallRecursively implements Runnable {
 	private final List<Long> measurement = new ArrayList<>(0xFFFF);
 
 	/**
-	 * Durchsucht den angegebenen Ordner und eventuell Subordner bis zu
-	 * <code>rekursiv</code> Ebenen.;
+	 * Durchsucht den angegebenen Ordner und eventuell Unterordner bis zu
+	 * <code>rekursiv</code> Ebenen.
 	 *
 	 * @param basisordner
 	 * @param rekursiv
@@ -171,8 +172,10 @@ public class ReadSmallRecursively implements Runnable {
 	public void scanLoop(File basedir, short recursions) throws InterruptedException {
 		dirsToScan.add(basedir);
 		do {
-			for (int i = dirsToScan.size(); i --> 0; )
-			scan(dirsToScan.remove(i), recursions);
+			// don't get confused about newly added things in dirsToScan
+			for (int i = dirsToScan.size(); i --> 0; ) {
+				scan(dirsToScan.remove(i), recursions);
+			}
 		} while (!dirsToScan.isEmpty() && recursions --> 0);
 		LOG.log(Level.FINEST, "Traverser finished.");
 		this.listingFinished = true;
@@ -188,7 +191,7 @@ public class ReadSmallRecursively implements Runnable {
 			throw new IllegalStateException(BUNDLE.getString("KEINE STATS GELADEN"));
 		}
 		LOG.log(Level.FINE, "Storing stats in {0}", stF.getAbsolutePath());
-		try (var stos = new FileOutputStream(stF)) {
+		try (var stos = new FileWriter(stF, StandardCharsets.UTF_8)) {
 			stats.store(stos, BUNDLE.getString("GENERATED STATS"));
 		}
 	}
